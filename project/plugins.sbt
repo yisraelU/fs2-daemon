@@ -1,0 +1,7 @@
+addSbtPlugin("org.scalameta" % "sbt-scalafmt" % "2.4.6")
+addSbtPlugin("ch.epfl.scala" % "sbt-scalafix" % "0.11.1")
+addSbtPlugin("com.eed3si9n" % "sbt-assembly" % "2.1.5")
+
+addSbtPlugin("org.typelevel" % "sbt-typelevel" % "0.8.4")
+addSbtPlugin("org.typelevel" % "sbt-typelevel-site" % "0.8.4")
+addSbtPlugin("org.typelevel" % "sbt-typelevel-scalafix" % "0.8.4")

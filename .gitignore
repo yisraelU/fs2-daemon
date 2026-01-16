@@ -1,0 +1,19 @@
+.idea
+.bsp
+.bloop
+.metals
+.vscode
+**/target
+**metals.sbt
+
+# Daemon runtime files
+/tmp/dynamic
+/tmp/apireg-daemon/
+/tmp/apireg-daemon.log
+
+# macOS
+.DS_Store
+project/project
+project/target
+modules/**/target
+target/

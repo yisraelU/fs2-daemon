@@ -1,0 +1,311 @@
+package com.disneystreaming.apiregistry.daemon
+
+import cats.effect.IO
+import cats.effect.std.CountDownLatch
+import cats.syntax.all._
+import fs2.io.file.{Files, Path}
+import munit.CatsEffectSuite
+import TestUtils._
+
+import java.nio.file.{Path => JPath}
+import scala.concurrent.duration._
+
+/**
+ * Stress tests for daemon lock directory handling.
+ *
+ * These tests cover edge cases, race conditions, and extreme scenarios.
+ */
+class DaemonStressTest extends CatsEffectSuite {
+
+  override def munitTimeout: Duration = 30.seconds
+
+  test("stress: 100 sequential daemon starts") {
+    val name = uniqueName
+
+    val sequentialStarts = (1 to 100).toList.traverse_ { i =>
+      Daemon.acquire[IO](name).use { ctx =>
+        // Quick verification
+        IO(assertEquals(ctx.lockDir.fileName.toString, name))
+      }
+    }
+
+    sequentialStarts.guarantee(cleanup(name))
+  }
+
+  test("stress: many concurrent lock attempts, only one succeeds") {
+    val name = uniqueName
+
+    for {
+      latch <- CountDownLatch[IO](1)
+
+      // Launch 50 concurrent attempts to acquire the lock
+      fibers <- (1 to 50).toList.traverse { i =>
+        Daemon
+          .acquire[IO](name)
+          .use { ctx =>
+            latch.release *> // Signal that someone got the lock
+              IO.sleep(100.millis) // Hold it briefly
+          }
+          .attempt
+          .start
+      }
+
+      // Wait for at least one to acquire the lock
+      _ <- latch.await
+
+      // Collect results
+      results <- fibers.traverse(_.joinWithNever)
+
+      _ <- cleanup(name)
+
+      // Exactly one should succeed, rest should fail
+      successes = results.count(_.isRight)
+      failures = results.count(_.isLeft)
+
+      _ = assertEquals(
+        successes,
+        1,
+        "Exactly one concurrent acquire should succeed"
+      )
+      _ = assertEquals(failures, 49, "All other acquires should fail")
+
+    } yield ()
+  }
+
+  test("stress: rapid start/stop cycles") {
+    val name = uniqueName
+
+    val rapidCycles = (1 to 50).toList.traverse_ { i =>
+      Daemon.acquire[IO](name).use { _ =>
+        IO.unit // Immediately release
+      } *>
+        IO.sleep(1.milli) // Tiny pause between cycles
+    }
+
+    rapidCycles.guarantee(cleanup(name))
+  }
+
+  test("stress: concurrent different daemons") {
+    val names = (1 to 20).map(_ => uniqueName).toList
+
+    val concurrentDaemons = names.parTraverse { name =>
+      Daemon.acquire[IO](name).use { ctx =>
+        IO.sleep(50.millis) *>
+          IO(assertEquals(ctx.lockDir.fileName.toString, name))
+      }
+    }
+
+    concurrentDaemons.guarantee(
+      names.traverse_(cleanup)
+    )
+  }
+
+  test("stress: lock survives file system checks during hold") {
+    val name = uniqueName
+
+    Daemon
+      .acquire[IO](name)
+      .use { ctx =>
+        // While holding lock, do lots of file system operations on the directory
+        val fsOperations = (1 to 100).toList.traverse_ { i =>
+          for {
+            _ <- Files[IO].exists(ctx.lockDir)
+            _ <- Files[IO].exists(ctx.lockDir.resolve("daemon.lock"))
+            _ <- Files[IO].list(ctx.lockDir).compile.drain
+            _ <- Files[IO].exists(Path(ctx.socketAddress.path))
+          } yield ()
+        }
+
+        fsOperations
+      }
+      .guarantee(cleanup(name))
+  }
+
+  test("edge case: metadata file corruption doesn't prevent cleanup") {
+    val name = uniqueName
+    val tmpDir =
+      Path.fromNioPath(JPath.of(System.getProperty("java.io.tmpdir")))
+    val lockDir = tmpDir.resolve(name)
+
+    // First run: create lock
+    val run1 = Daemon.acquire[IO](name).use { _ => IO.unit }
+
+    // Corrupt metadata (need to recreate directory since run1 cleaned up)
+    val corrupt = for {
+      _ <- Files[IO].createDirectories(lockDir)
+      _ <- writeFile(lockDir.resolve("daemon.info"), "CORRUPTED DATA!!!")
+    } yield ()
+
+    // Second run: should still work (overwrites corrupt metadata)
+    val run2 = Daemon.acquire[IO](name).use { ctx =>
+      Files[IO].readUtf8(lockDir.resolve("daemon.info")).compile.string.map {
+        content =>
+          assert(!content.contains("CORRUPTED"))
+          assert(content.contains(s"pid=${ctx.pid.value}"))
+      }
+    }
+
+    (run1 *> corrupt *> run2).guarantee(cleanup(name))
+  }
+
+  test("edge case: PID file with wrong PID doesn't prevent startup") {
+    val name = uniqueName
+    val tmpDir =
+      Path.fromNioPath(JPath.of(System.getProperty("java.io.tmpdir")))
+    val lockDir = tmpDir.resolve(name)
+
+    // Create stale PID file with different PID
+    val createStalePid = for {
+      _ <- Files[IO].createDirectories(lockDir)
+      _ <- writeFile(lockDir.resolve("daemon.pid"), "999999")
+    } yield ()
+
+    createStalePid *>
+      Daemon
+        .acquire[IO](name)
+        .use { ctx =>
+          Files[IO].readUtf8(lockDir.resolve("daemon.pid")).compile.string.map {
+            pidContent =>
+              // Should have overwritten stale PID
+              assertEquals(pidContent.trim, ctx.pid.value.toString)
+              assertNotEquals(pidContent.trim, "999999")
+          }
+        }
+        .guarantee(cleanup(name))
+  }
+
+  test("edge case: socket file already exists") {
+    val name = uniqueName
+    val tmpDir =
+      Path.fromNioPath(JPath.of(System.getProperty("java.io.tmpdir")))
+    val lockDir = tmpDir.resolve(name)
+
+    // Create stale socket file
+    val createStaleSocket = for {
+      _ <- Files[IO].createDirectories(lockDir)
+      socketPath = lockDir.resolve("daemon.sock")
+      _ <- writeFile(socketPath, "stale socket data")
+    } yield ()
+
+    createStaleSocket *>
+      Daemon
+        .acquire[IO](name)
+        .use { ctx =>
+          // Should succeed - stale socket was deleted
+          IO.unit
+        }
+        .guarantee(cleanup(name))
+  }
+
+  test("edge case: directory with many stale files") {
+    val name = uniqueName
+    val tmpDir =
+      Path.fromNioPath(JPath.of(System.getProperty("java.io.tmpdir")))
+    val lockDir = tmpDir.resolve(name)
+
+    // Create directory with lots of stale files
+    val createStaleFiles = for {
+      _ <- Files[IO].createDirectories(lockDir)
+      _ <- (1 to 100).toList.traverse_ { i =>
+        writeFile(lockDir.resolve(s"stale-$i.txt"), s"stale data $i")
+      }
+    } yield ()
+
+    createStaleFiles *>
+      Daemon
+        .acquire[IO](name)
+        .use { ctx =>
+          // Should succeed despite many stale files
+          Files[IO].list(lockDir).compile.toList.map { files =>
+            // Should have our expected files plus potentially stale ones
+            val fileNames = files.map(_.fileName.toString).toSet
+            assert(fileNames.contains("daemon.lock"))
+            assert(fileNames.contains("daemon.pid"))
+            assert(fileNames.contains("daemon.info"))
+          }
+        }
+        .guarantee(cleanup(name))
+  }
+
+  test("edge case: checkRunning with corrupted metadata") {
+    val name = uniqueName
+    val tmpDir =
+      Path.fromNioPath(JPath.of(System.getProperty("java.io.tmpdir")))
+    val lockDir = tmpDir.resolve(name)
+
+    val createCorruptedMetadata = for {
+      _ <- Files[IO].createDirectories(lockDir)
+      _ <- writeFile(lockDir.resolve("daemon.pid"), "not-a-number")
+      _ <- writeFile(lockDir.resolve("daemon.info"), "corrupted!!!")
+    } yield ()
+
+    createCorruptedMetadata *>
+      Daemon
+        .checkRunning[IO](name)
+        .attempt
+        .flatMap { result =>
+          // Should either return None or fail gracefully
+          IO(assert(result.isLeft || result == Right(None)))
+        }
+        .guarantee(cleanup(name))
+  }
+
+  test("race condition: two processes try to create directory simultaneously") {
+    val name = uniqueName
+
+    for {
+      latch <- CountDownLatch[IO](2)
+
+      // Both wait at the latch, then try to create simultaneously
+      fiber1 <- (latch.release *> latch.await *>
+        Daemon.acquire[IO](name).use(_ => IO.sleep(50.millis))).attempt.start
+
+      fiber2 <- (latch.release *> latch.await *>
+        Daemon.acquire[IO](name).use(_ => IO.sleep(50.millis))).attempt.start
+
+      result1 <- fiber1.joinWithNever
+      result2 <- fiber2.joinWithNever
+
+      _ <- cleanup(name)
+
+      // Exactly one should succeed
+      results = List(result1, result2)
+      successes = results.count(_.isRight)
+      failures = results.count(_.isLeft)
+
+      _ = assertEquals(successes, 1, "Exactly one should acquire lock")
+      _ = assertEquals(failures, 1, "The other should fail")
+
+    } yield ()
+  }
+
+  test(
+    "memory leak check: many sequential creates don't leak file descriptors"
+  ) {
+    val name = uniqueName
+
+    // This should not exhaust file descriptors
+    val manySequentialCreates = (1 to 1000).toList.traverse_ { i =>
+      Daemon.acquire[IO](name).use { _ => IO.unit }
+    }
+
+    manySequentialCreates.guarantee(cleanup(name))
+  }
+
+  test("timeout: acquire fails quickly if lock can't be obtained") {
+    val name = uniqueName
+
+    Daemon
+      .acquire[IO](name)
+      .use { _ =>
+        // Hold lock
+        val attemptAcquire = Daemon.acquire[IO](name).use(_ => IO.unit).attempt
+
+        // Should fail quickly (not hang)
+        attemptAcquire.timeout(1.second).flatMap { result =>
+          IO(assert(result.isLeft, "Should fail when lock is held"))
+        }
+      }
+      .guarantee(cleanup(name))
+  }
+}
