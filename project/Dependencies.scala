@@ -95,7 +95,8 @@ object Dependencies {
       log4catsSlf4j,
       circeCore,
       circeGeneric,
-      circeParser
+      circeParser,
+      jnrUnixSocket
     )
 
     val testDependencies = Seq(
@@ -115,12 +116,4 @@ object Dependencies {
     )
   }
 
-  object Server {
-    val dependencies = Seq(
-      directories,
-      jnrUnixSocket,
-      fs2Io,
-      log4catsSlf4j
-    )
-  }
 }

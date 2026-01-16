@@ -1,4 +1,4 @@
-import Dependencies._
+import Dependencies.*
 
 ThisBuild / version := "0.1.0-SNAPSHOT"
 
@@ -37,6 +37,11 @@ lazy val daemon = (projectMatrix in file("modules/daemon"))
     libraryDependencies ++= Daemon.dependencies ++ Daemon.testDependencies
   )
   .jvmPlatform(scalaVersions)
+
+lazy val docs = projectMatrix
+  .in(file("site"))
+  .jvmPlatform(List(Versions.scala213))
+  .enablePlugins(TypelevelSitePlugin)
 
 addCommandAlias(
   "lint",
