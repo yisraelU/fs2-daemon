@@ -3,7 +3,7 @@ import sbt._
 object Dependencies {
   // Versions
   object Versions {
-    val scala213 = "2.13.16"
+    val scala213 = "2.13.18"
     val scala3 = "3.3.4"
 
     val smithy4s = "0.18.45"
@@ -12,7 +12,7 @@ object Dependencies {
 
     val catsEffect = "3.6.3"
     val fs2 = "3.12.2"
-    val http4s = "0.23.33"
+    val http4s = "0.23.39"
     val circe = "0.14.15"
     val decline = "2.5.0"
     val log4cats = "2.7.1"
