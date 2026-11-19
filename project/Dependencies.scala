@@ -12,7 +12,7 @@ object Dependencies {
 
     val catsEffect = "3.6.3"
     val fs2 = "3.12.2"
-    val http4s = "0.23.33"
+    val http4s = "0.23.39"
     val circe = "0.14.15"
     val decline = "2.5.0"
     val log4cats = "2.7.1"
